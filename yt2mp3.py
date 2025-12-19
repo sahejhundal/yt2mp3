@@ -10,6 +10,8 @@ def download_youtube_audio(url, output_path='downloads'):
             'preferredquality': '320',
         }],
         'outtmpl': f'{output_path}/%(title)s.%(ext)s',
+        'ignoreerrors': True,                                   # prevent crashing if video was taken down or anything
+        'download_archive': f'{output_path}/.downloaded.txt',   # download log to skip duplicates
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
