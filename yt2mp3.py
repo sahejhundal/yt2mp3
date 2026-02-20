@@ -11,14 +11,27 @@ def sanitize_filename(name):
     return name.strip('. ')
 
 
-def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None):
+def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None, metadata=None):
+    postprocessors = [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '320',
+    }]
+
+    pp_args = {}
+
+    if metadata:
+        meta_args = []
+        for key, value in metadata.items():
+            if value:
+                meta_args.extend(['-metadata', f'{key}={value}'])
+        pp_args['extractaudio'] = meta_args
+    else:
+        postprocessors.append({'key': 'FFmpegMetadata'})
+
     opts = {
         'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '320',
-        }],
+        'postprocessors': postprocessors,
         'outtmpl': outtmpl or f'{output_path}/%(title)s.%(ext)s',
         'ignoreerrors': True,
         'download_archive': archive_path or f'{output_path}/.downloaded.txt',
@@ -29,6 +42,9 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None):
         'quiet': False,
         'no_warnings': False,
     }
+
+    if pp_args:
+        opts['postprocessor_args'] = pp_args
     if force:
         opts.pop('download_archive', None)
     return opts
@@ -146,19 +162,32 @@ def download_artist_discography(artist_query, category='all', output_path='downl
         print(f'{len(tracks)} track(s)')
         print('=' * 60)
 
+        total = len(tracks)
         for i, track in enumerate(tracks, 1):
             video_id = track.get('videoId')
             if not video_id:
                 continue
-            track_title = sanitize_filename(track.get('title', 'Unknown'))
+            track_title_raw = track.get('title', 'Unknown')
+            track_title = sanitize_filename(track_title_raw)
             url = f'https://music.youtube.com/watch?v={video_id}'
             outtmpl = os.path.join(release_path, f'{i:02d} - {track_title}.%(ext)s')
+
+            metadata = {
+                'title': track_title_raw,
+                'artist': artist_name,
+                'album_artist': artist_name,
+                'album': title,
+                'track': f'{i}/{total}',
+                'disc': '1/1',
+                'date': year,
+            }
 
             opts = make_ydl_opts(
                 release_path,
                 force=force,
                 outtmpl=outtmpl,
                 archive_path=archive_path,
+                metadata=metadata,
             )
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
