@@ -5,6 +5,7 @@ A simple Python script to download YouTube videos and playlists as high-quality 
 ## Features
 
 - Download single videos or entire playlists
+- **Download an artist's full discography** (albums, singles, EPs, or all)
 - Automatic conversion to 320kbps MP3
 - Skip videos that fail (copyright claims, unavailable videos)
 - Track downloaded videos to prevent duplicates
@@ -53,11 +54,41 @@ Pass the URL as an argument (remember to use quotes for URLs with special charac
 python yt2mp3.py "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
+### Force Re-download
+If a video is already in `downloads/.downloaded.txt`, you can override skip behavior:
+```bash
+python yt2mp3.py --force "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+Short flag:
+```bash
+python yt2mp3.py -f "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
 ### Downloading Playlists
 The script automatically handles playlists:
 ```bash
 python yt2mp3.py "https://www.youtube.com/playlist?list=PLAYLIST_ID"
 ```
+
+### Artist Discography
+Download an artist's full discography from YouTube Music:
+```bash
+python yt2mp3.py --artist "Kendrick Lamar"
+```
+
+Filter by release type — `albums`, `singles`, `eps`, or `all` (default):
+```bash
+python yt2mp3.py --artist "Frank Ocean" --category albums
+python yt2mp3.py -a "SZA" -c singles
+python yt2mp3.py -a "Tyler, The Creator" -c eps
+```
+
+Combine with `--force` to re-download everything:
+```bash
+python yt2mp3.py -a "The Weeknd" -c all -f
+```
+
+Files are organized as `downloads/Artist/Release Name/01 - Track.mp3`.
 
 ## Output
 
