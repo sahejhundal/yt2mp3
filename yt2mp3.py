@@ -2,6 +2,8 @@ import sys
 import os
 import re
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import yt_dlp
 
 
@@ -11,7 +13,8 @@ def sanitize_filename(name):
     return name.strip('. ')
 
 
-def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None, metadata=None):
+def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
+                  metadata=None, quiet=False):
     postprocessors = [{
         'key': 'FFmpegExtractAudio',
         'preferredcodec': 'mp3',
@@ -39,8 +42,8 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None, met
         'referer': 'https://www.youtube.com/',
         'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
         'nocheckcertificate': False,
-        'quiet': False,
-        'no_warnings': False,
+        'quiet': quiet,
+        'no_warnings': quiet,
     }
 
     if pp_args:
@@ -56,7 +59,25 @@ def download_youtube_audio(url, output_path='downloads', force=False):
         ydl.download([url])
 
 
-def download_artist_discography(artist_query, category='all', output_path='downloads', force=False):
+def _download_track(url, opts, label, progress):
+    """Worker for concurrent downloads. Returns True on success."""
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        with progress['lock']:
+            progress['done'] += 1
+            pct = progress['done'] / progress['total'] * 100
+            print(f'  [{progress["done"]}/{progress["total"]}] ({pct:3.0f}%) {label}')
+        return True
+    except Exception as e:
+        with progress['lock']:
+            progress['done'] += 1
+            print(f'  [{progress["done"]}/{progress["total"]}] FAILED: {label} — {e}')
+        return False
+
+
+def download_artist_discography(artist_query, category='all', output_path='downloads',
+                                force=False, jobs=4):
     try:
         from ytmusicapi import YTMusic
     except ImportError:
@@ -127,8 +148,11 @@ def download_artist_discography(artist_query, category='all', output_path='downl
     }[category]
 
     archive_path = os.path.join(output_path, safe_artist, '.downloaded.txt')
-    total_tracks = 0
-    total_releases = 0
+    concurrent = jobs > 1
+
+    # --- gather phase: collect every track as a download task ---
+    tasks = []  # list of (url, opts, label)
+    release_count = 0
 
     for release in raw_releases:
         browse_id = release.get('browseId')
@@ -153,16 +177,14 @@ def download_artist_discography(artist_query, category='all', output_path='downl
 
         safe_title = sanitize_filename(title)
         release_path = os.path.join(output_path, safe_artist, safe_title)
+        release_count += 1
 
         header = f'{release_type}: {title}'
         if year:
             header += f' ({year})'
-        print(f'\n{"=" * 60}')
-        print(header)
-        print(f'{len(tracks)} track(s)')
-        print('=' * 60)
+        print(f'  {header}  ({len(tracks)} track(s))')
 
-        total = len(tracks)
+        num_tracks = len(tracks)
         for i, track in enumerate(tracks, 1):
             video_id = track.get('videoId')
             if not video_id:
@@ -177,7 +199,7 @@ def download_artist_discography(artist_query, category='all', output_path='downl
                 'artist': artist_name,
                 'album_artist': artist_name,
                 'album': title,
-                'track': f'{i}/{total}',
+                'track': f'{i}/{num_tracks}',
                 'disc': '1/1',
                 'date': year,
             }
@@ -188,15 +210,42 @@ def download_artist_discography(artist_query, category='all', output_path='downl
                 outtmpl=outtmpl,
                 archive_path=archive_path,
                 metadata=metadata,
+                quiet=concurrent,
             )
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-            total_tracks += 1
+            label = f'{title} — {track_title_raw}'
+            tasks.append((url, opts, label))
 
-        total_releases += 1
+    if not tasks:
+        print('No tracks to download.')
+        return
+
+    # --- download phase ---
+    print(f'\n{"=" * 60}')
+    print(f'{len(tasks)} track(s) across {release_count} release(s)'
+          f' — {jobs} concurrent worker(s)')
+    print('=' * 60)
+
+    progress = {
+        'done': 0,
+        'total': len(tasks),
+        'lock': threading.Lock(),
+    }
+
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [
+                pool.submit(_download_track, url, opts, label, progress)
+                for url, opts, label in tasks
+            ]
+            successes = sum(f.result() for f in as_completed(futures))
+    else:
+        successes = 0
+        for url, opts, label in tasks:
+            if _download_track(url, opts, label, progress):
+                successes += 1
 
     print(f'\n{"=" * 60}')
-    print(f'Done! {total_releases} release(s), {total_tracks} track(s) processed.')
+    print(f'Done! {successes}/{len(tasks)} track(s) downloaded.')
     print(f'Files saved to: {output_path}/{safe_artist}/')
     print('=' * 60)
 
@@ -219,6 +268,8 @@ def build_parser():
     parser.add_argument('-c', '--category',
                         choices=['albums', 'singles', 'eps', 'all'], default='all',
                         help='which release types to download (default: all)')
+    parser.add_argument('-j', '--jobs', type=int, default=4,
+                        help='concurrent downloads (default: 4, use 1 for sequential)')
     return parser
 
 
@@ -231,6 +282,7 @@ if __name__ == '__main__':
             args.artist,
             category=args.category,
             force=args.force,
+            jobs=max(1, args.jobs),
         )
     elif args.url:
         download_youtube_audio(args.url, force=args.force)
