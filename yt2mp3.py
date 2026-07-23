@@ -35,9 +35,10 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
     opts = {
         'format': 'bestaudio/best',
         'postprocessors': postprocessors,
-        'outtmpl': outtmpl or f'{output_path}/%(title)s.%(ext)s',
+        'paths': {'home': output_path},
+        'outtmpl': {'default': outtmpl or '%(title)s.%(ext)s'},
         'ignoreerrors': True,
-        'download_archive': archive_path or f'{output_path}/.downloaded.txt',
+        'download_archive': archive_path or os.path.join(output_path, '.downloaded.txt'),
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'referer': 'https://www.youtube.com/',
         'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
@@ -59,6 +60,20 @@ def download_youtube_audio(url, output_path='downloads', force=False):
         ydl.download([url])
 
 
+def _channel_id_from_input(value):
+    """Return a YouTube channel id (UC...) from a URL or raw id, else None."""
+    match = re.search(r'(UC[\w-]{22})', value or '')
+    return match.group(1) if match else None
+
+
+def _join_artists(artists):
+    """Join a ytmusicapi artists list into 'A, B' or None if empty."""
+    if not artists:
+        return None
+    names = [a.get('name') for a in artists if a.get('name')]
+    return ', '.join(names) if names else None
+
+
 def _download_track(url, opts, label, progress):
     """Worker for concurrent downloads. Returns True on success."""
     try:
@@ -77,7 +92,7 @@ def _download_track(url, opts, label, progress):
 
 
 def download_artist_discography(artist_query, category='all', output_path='downloads',
-                                force=False, jobs=4):
+                                force=False, jobs=4, override_artist=None):
     try:
         from ytmusicapi import YTMusic
     except ImportError:
@@ -87,29 +102,36 @@ def download_artist_discography(artist_query, category='all', output_path='downl
 
     ytmusic = YTMusic()
 
-    print(f'Searching for "{artist_query}"...')
-    results = ytmusic.search(artist_query, filter='artists')
-    if not results:
-        print('No artists found.')
-        sys.exit(1)
+    channel_id = _channel_id_from_input(artist_query)
+    if channel_id:
+        info = ytmusic.get_artist(channel_id)
+        artist_name = info.get('name') or channel_id
+        artist_id = channel_id
+    else:
+        print(f'Searching for "{artist_query}"...')
+        results = ytmusic.search(artist_query, filter='artists')
+        if not results:
+            print('No artists found.')
+            sys.exit(1)
 
-    print()
-    for i, r in enumerate(results[:5]):
-        subs = r.get('subscribers', '')
-        label = f'  {i + 1}. {r["artist"]}'
-        if subs:
-            label += f'  ({subs})'
-        print(label)
+        print()
+        for i, r in enumerate(results[:5]):
+            subs = r.get('subscribers', '')
+            label = f'  {i + 1}. {r["artist"]}'
+            if subs:
+                label += f'  ({subs})'
+            print(label)
 
-    print()
-    choice = input('Select artist [1]: ').strip() or '1'
-    if not choice.isdigit() or not (1 <= int(choice) <= min(5, len(results))):
-        print('Invalid choice.')
-        sys.exit(1)
-    artist = results[int(choice) - 1]
+        print()
+        choice = input('Select artist [1]: ').strip() or '1'
+        if not choice.isdigit() or not (1 <= int(choice) <= min(5, len(results))):
+            print('Invalid choice.')
+            sys.exit(1)
+        artist = results[int(choice) - 1]
 
-    artist_id = artist['browseId']
-    artist_name = artist['artist']
+        artist_id = artist['browseId']
+        artist_name = artist['artist']
+
     safe_artist = sanitize_filename(artist_name)
 
     print(f'\nFetching discography for {artist_name}...\n')
@@ -148,6 +170,7 @@ def download_artist_discography(artist_query, category='all', output_path='downl
     }[category]
 
     archive_path = os.path.join(output_path, safe_artist, '.downloaded.txt')
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
     concurrent = jobs > 1
 
     # --- gather phase: collect every track as a download task ---
@@ -177,6 +200,7 @@ def download_artist_discography(artist_query, category='all', output_path='downl
 
         safe_title = sanitize_filename(title)
         release_path = os.path.join(output_path, safe_artist, safe_title)
+        os.makedirs(release_path, exist_ok=True)
         release_count += 1
 
         header = f'{release_type}: {title}'
@@ -192,12 +216,18 @@ def download_artist_discography(artist_query, category='all', output_path='downl
             track_title_raw = track.get('title', 'Unknown')
             track_title = sanitize_filename(track_title_raw)
             url = f'https://music.youtube.com/watch?v={video_id}'
-            outtmpl = os.path.join(release_path, f'{i:02d} - {track_title}.%(ext)s')
+            outtmpl = f'{i:02d} - {track_title}.%(ext)s'
 
+            if override_artist:
+                album_artists = override_artist
+                track_artist = override_artist
+            else:
+                album_artists = _join_artists(album_info.get('artists')) or artist_name
+                track_artist = _join_artists(track.get('artists')) or album_artists
             metadata = {
                 'title': track_title_raw,
-                'artist': artist_name,
-                'album_artist': artist_name,
+                'artist': track_artist,
+                'album_artist': album_artists,
                 'album': title,
                 'track': f'{i}/{num_tracks}',
                 'disc': '1/1',
@@ -260,11 +290,16 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('url', nargs='?', default=None,
-                        help='YouTube URL to download')
+                        help='YouTube video URL to download, or a Music channel '
+                             'URL to download a discography')
     parser.add_argument('-f', '--force', action='store_true',
                         help='re-download tracks even if already downloaded')
     parser.add_argument('-a', '--artist', default=None,
-                        help='search for an artist and download their discography')
+                        help='search for an artist and download their discography; '
+                             'also accepts a YouTube Music channel URL or UC... id')
+    parser.add_argument('--override-artist', default=None,
+                        help='force this name as the artist/album_artist tag on every '
+                             'track (e.g. when a channel reposts another artist)')
     parser.add_argument('-c', '--category',
                         choices=['albums', 'singles', 'eps', 'all'], default='all',
                         help='which release types to download (default: all)')
@@ -283,6 +318,15 @@ if __name__ == '__main__':
             category=args.category,
             force=args.force,
             jobs=max(1, args.jobs),
+            override_artist=args.override_artist,
+        )
+    elif args.url and _channel_id_from_input(args.url):
+        download_artist_discography(
+            args.url,
+            category=args.category,
+            force=args.force,
+            jobs=max(1, args.jobs),
+            override_artist=args.override_artist,
         )
     elif args.url:
         download_youtube_audio(args.url, force=args.force)
@@ -304,4 +348,13 @@ if __name__ == '__main__':
         if url is None:
             print('No URL provided')
             sys.exit(1)
-        download_youtube_audio(url, force=force)
+        if _channel_id_from_input(url):
+            download_artist_discography(
+                url,
+                category=args.category,
+                force=force,
+                jobs=max(1, args.jobs),
+                override_artist=args.override_artist,
+            )
+        else:
+            download_youtube_audio(url, force=force)
