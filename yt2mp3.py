@@ -75,6 +75,17 @@ def _channel_id_from_input(value):
     return match.group(1) if match else None
 
 
+def _playlist_id_from_input(value):
+    """Return a YouTube/YouTube Music playlist id from a URL or raw id."""
+    value = value or ''
+    match = re.search(r'[?&]list=([^&]+)', value)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r'(?:OLAK5uy_[\w-]+|VL[\w-]+|PL[\w-]+|RD[\w-]+)', value):
+        return value
+    return None
+
+
 def _join_artists(artists):
     """Join a ytmusicapi artists list into 'A, B' or None if empty."""
     if not artists:
@@ -144,6 +155,36 @@ def _get_artist_section_releases(ytmusic, artist_id, section, label):
     return releases
 
 
+def _get_artist_videos(ytmusic, artist_info):
+    """Return artist music videos, including more items from the videos playlist."""
+    section = artist_info.get('videos') or {}
+    videos = []
+    seen = set()
+
+    def add_items(items):
+        for item in items or []:
+            video_id = item.get('videoId')
+            if video_id and video_id not in seen:
+                videos.append(item)
+                seen.add(video_id)
+
+    add_items(section.get('results', []))
+
+    browse_id = section.get('browseId')
+    if browse_id:
+        try:
+            playlist = ytmusic.get_playlist(browse_id, limit=1000)
+            add_items(playlist.get('tracks', []))
+        except Exception as e:
+            reason = _short_error(e)
+            if videos:
+                print(f'  Warning: could not fetch more music videos; using listed results. {reason}.')
+            else:
+                print(f'  Warning: could not fetch music videos. {reason}.')
+
+    return videos
+
+
 def _fallback_album_from_artist_songs(release, artist_info, artist_name):
     """Build a one-track release from get_artist()['songs'] if get_album() fails."""
     songs_section = artist_info.get('songs') or {}
@@ -176,6 +217,105 @@ def _fallback_album_from_artist_songs(release, artist_info, artist_name):
         }
 
     return None
+
+
+def _run_download_tasks(tasks, release_count, skipped_releases, skipped_tracks,
+                        output_path, safe_artist, jobs):
+    if not tasks:
+        print('No tracks to download.')
+        return False
+
+    print(f'\n{"=" * 60}')
+    print(f'{len(tasks)} track(s) across {release_count} release(s)'
+          f' — {jobs} concurrent worker(s)')
+    print('=' * 60)
+
+    progress = {
+        'done': 0,
+        'total': len(tasks),
+        'lock': threading.Lock(),
+        'failures': [],
+    }
+
+    if jobs > 1:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [
+                pool.submit(_download_track, url, opts, label, progress)
+                for url, opts, label in tasks
+            ]
+            successes = sum(f.result() for f in as_completed(futures))
+    else:
+        successes = 0
+        for url, opts, label in tasks:
+            if _download_track(url, opts, label, progress):
+                successes += 1
+
+    print(f'\n{"=" * 60}')
+    print(f'Done! {successes}/{len(tasks)} queued track(s) completed.')
+    if skipped_releases or skipped_tracks or progress['failures']:
+        print('\nSome items were not downloaded:')
+        for title, browse_id, reason in skipped_releases:
+            print(f'  Release skipped: {title} ({browse_id}) — {reason}')
+        for release_title, track_title, reason in skipped_tracks:
+            print(f'  Track skipped: {release_title} — {track_title} — {reason}')
+        for label, reason in progress['failures']:
+            print(f'  Download failed: {label} — {reason}')
+    else:
+        print('No skipped releases or failed downloads reported.')
+    print(f'Files saved to: {output_path}/{safe_artist}/')
+    print('=' * 60)
+    return not (skipped_releases or skipped_tracks or progress['failures'])
+
+
+def _queue_album_tracks(album_info, output_path, safe_artist, archive_path,
+                        artist_name, override_artist, force, quiet,
+                        tasks, skipped_tracks):
+    title = album_info.get('title', 'Unknown')
+    year = album_info.get('year', '')
+    tracks = album_info.get('tracks', [])
+    safe_title = sanitize_filename(title)
+    release_path = os.path.join(output_path, safe_artist, safe_title)
+    os.makedirs(release_path, exist_ok=True)
+
+    num_tracks = len(tracks)
+    for i, track in enumerate(tracks, 1):
+        video_id = track.get('videoId')
+        track_title_raw = track.get('title', 'Unknown')
+        if not video_id:
+            skipped_tracks.append((title, track_title_raw, 'No video id found'))
+            print(f'    Skipping track: {title} — {track_title_raw} (no video id found)')
+            continue
+
+        track_title = sanitize_filename(track_title_raw)
+        url = f'https://music.youtube.com/watch?v={video_id}'
+        outtmpl = f'{i:02d} - {track_title}.%(ext)s'
+
+        if override_artist:
+            album_artists = override_artist
+            track_artist = override_artist
+        else:
+            album_artists = _join_artists(album_info.get('artists')) or artist_name
+            track_artist = _join_artists(track.get('artists')) or album_artists
+        metadata = {
+            'title': track_title_raw,
+            'artist': track_artist,
+            'album_artist': album_artists,
+            'album': title,
+            'track': f'{i}/{num_tracks}',
+            'disc': '1/1',
+            'date': year,
+        }
+
+        opts = make_ydl_opts(
+            release_path,
+            force=force,
+            outtmpl=outtmpl,
+            archive_path=archive_path,
+            metadata=metadata,
+            quiet=quiet,
+        )
+        label = f'{title} — {track_title_raw}'
+        tasks.append((url, opts, label))
 
 
 def download_artist_discography(artist_query, category='all', output_path='downloads',
@@ -290,100 +430,121 @@ def download_artist_discography(artist_query, category='all', output_path='downl
             print(f'  Skipping release: {title} ({browse_id}) — no tracks found')
             continue
 
-        safe_title = sanitize_filename(title)
-        release_path = os.path.join(output_path, safe_artist, safe_title)
-        os.makedirs(release_path, exist_ok=True)
         release_count += 1
-
         header = f'{release_type}: {title}'
         if year:
             header += f' ({year})'
         print(f'  {header}  ({len(tracks)} track(s))')
 
-        num_tracks = len(tracks)
-        for i, track in enumerate(tracks, 1):
-            video_id = track.get('videoId')
-            if not video_id:
-                track_title_raw = track.get('title', 'Unknown')
-                skipped_tracks.append((title, track_title_raw, 'No video id found'))
-                print(f'    Skipping track: {title} — {track_title_raw} (no video id found)')
-                continue
-            track_title_raw = track.get('title', 'Unknown')
-            track_title = sanitize_filename(track_title_raw)
-            url = f'https://music.youtube.com/watch?v={video_id}'
-            outtmpl = f'{i:02d} - {track_title}.%(ext)s'
+        _queue_album_tracks(
+            album_info, output_path, safe_artist, archive_path,
+            artist_name, override_artist, force, concurrent,
+            tasks, skipped_tracks,
+        )
 
-            if override_artist:
-                album_artists = override_artist
-                track_artist = override_artist
-            else:
-                album_artists = _join_artists(album_info.get('artists')) or artist_name
-                track_artist = _join_artists(track.get('artists')) or album_artists
-            metadata = {
-                'title': track_title_raw,
-                'artist': track_artist,
-                'album_artist': album_artists,
-                'album': title,
-                'track': f'{i}/{num_tracks}',
-                'disc': '1/1',
-                'date': year,
+    if category == 'all':
+        videos = _get_artist_videos(ytmusic, artist_info)
+        if videos:
+            video_album = {
+                'title': 'Music Videos',
+                'type': 'Videos',
+                'year': '',
+                'artists': [{'name': artist_name, 'id': artist_id}],
+                'tracks': videos,
             }
-
-            opts = make_ydl_opts(
-                release_path,
-                force=force,
-                outtmpl=outtmpl,
-                archive_path=archive_path,
-                metadata=metadata,
-                quiet=concurrent,
+            release_count += 1
+            print(f'  Music Videos  ({len(videos)} video(s))')
+            _queue_album_tracks(
+                video_album, output_path, safe_artist, archive_path,
+                artist_name, override_artist, force, concurrent,
+                tasks, skipped_tracks,
             )
-            label = f'{title} — {track_title_raw}'
-            tasks.append((url, opts, label))
 
-    if not tasks:
-        print('No tracks to download.')
+    _run_download_tasks(
+        tasks, release_count, skipped_releases, skipped_tracks,
+        output_path, safe_artist, jobs,
+    )
+
+
+def download_music_playlist(playlist_query, output_path='downloads', force=False,
+                            jobs=4, override_artist=None):
+    try:
+        from ytmusicapi import YTMusic
+    except ImportError:
+        print('ytmusicapi is required for playlist/album downloads.')
+        print('Install with:  pip install ytmusicapi')
+        sys.exit(1)
+
+    playlist_id = _playlist_id_from_input(playlist_query)
+    if not playlist_id:
+        print('Could not find a playlist id in that URL/input.')
         return
 
-    # --- download phase ---
-    print(f'\n{"=" * 60}')
-    print(f'{len(tasks)} track(s) across {release_count} release(s)'
-          f' — {jobs} concurrent worker(s)')
-    print('=' * 60)
+    ytmusic = YTMusic()
+    print(f'\nFetching playlist/album {playlist_id}...\n')
 
-    progress = {
-        'done': 0,
-        'total': len(tasks),
-        'lock': threading.Lock(),
-        'failures': [],
-    }
+    skipped_releases = []
+    skipped_tracks = []
+    album_info = None
 
-    if concurrent:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [
-                pool.submit(_download_track, url, opts, label, progress)
-                for url, opts, label in tasks
-            ]
-            successes = sum(f.result() for f in as_completed(futures))
-    else:
-        successes = 0
-        for url, opts, label in tasks:
-            if _download_track(url, opts, label, progress):
-                successes += 1
+    try:
+        playlist = ytmusic.get_playlist(playlist_id, limit=1000)
+    except Exception as e:
+        print(f'Could not fetch playlist/album: {_short_error(e)}')
+        return
 
-    print(f'\n{"=" * 60}')
-    print(f'Done! {successes}/{len(tasks)} queued track(s) completed.')
-    if skipped_releases or skipped_tracks or progress['failures']:
-        print('\nSome items were not downloaded:')
-        for title, browse_id, reason in skipped_releases:
-            print(f'  Release skipped: {title} ({browse_id}) — {reason}')
-        for release_title, track_title, reason in skipped_tracks:
-            print(f'  Track skipped: {release_title} — {track_title} — {reason}')
-        for label, reason in progress['failures']:
-            print(f'  Download failed: {label} — {reason}')
-    else:
-        print('No skipped releases or failed downloads reported.')
-    print(f'Files saved to: {output_path}/{safe_artist}/')
-    print('=' * 60)
+    tracks = playlist.get('tracks', [])
+    album_id = None
+    for track in tracks:
+        album = track.get('album') or {}
+        if album.get('id', '').startswith('MPRE'):
+            album_id = album['id']
+            break
+
+    if album_id:
+        try:
+            album_info = ytmusic.get_album(album_id)
+        except Exception as e:
+            print(f'  Warning: album details unavailable; using playlist listing. {_short_error(e)}.')
+
+    if album_info is None:
+        album_info = {
+            'title': playlist.get('title') or playlist_id,
+            'type': 'Playlist',
+            'year': '',
+            'artists': tracks[0].get('artists') if tracks else [],
+            'tracks': tracks,
+        }
+
+    title = album_info.get('title', playlist.get('title') or playlist_id)
+    artists = album_info.get('artists') or []
+    artist_name = override_artist or _join_artists(artists) or 'Unknown Artist'
+    safe_artist = sanitize_filename(artist_name)
+    archive_path = os.path.join(output_path, safe_artist, '.downloaded.txt')
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+
+    tracks = album_info.get('tracks', [])
+    if not tracks:
+        skipped_releases.append((title, album_id or playlist_id, 'No tracks found in playlist/album'))
+
+    release_type = album_info.get('type') or 'Playlist'
+    year = album_info.get('year', '')
+    header = f'{release_type}: {title}'
+    if year:
+        header += f' ({year})'
+    print(f'  {header}  ({len(tracks)} track(s))')
+
+    tasks = []
+    _queue_album_tracks(
+        album_info, output_path, safe_artist, archive_path,
+        artist_name, override_artist, force, jobs > 1,
+        tasks, skipped_tracks,
+    )
+
+    _run_download_tasks(
+        tasks, 1 if tracks else 0, skipped_releases, skipped_tracks,
+        output_path, safe_artist, jobs,
+    )
 
 
 def build_parser():
@@ -396,7 +557,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('url', nargs='?', default=None,
-                        help='YouTube video URL to download, or a Music channel '
+                        help='YouTube video URL, Music playlist/album URL, or Music channel '
                              'URL to download a discography')
     parser.add_argument('-f', '--force', action='store_true',
                         help='re-download tracks even if already downloaded')
@@ -434,6 +595,13 @@ if __name__ == '__main__':
             jobs=max(1, args.jobs),
             override_artist=args.override_artist,
         )
+    elif args.url and _playlist_id_from_input(args.url):
+        download_music_playlist(
+            args.url,
+            force=args.force,
+            jobs=max(1, args.jobs),
+            override_artist=args.override_artist,
+        )
     elif args.url:
         download_youtube_audio(args.url, force=args.force)
     else:
@@ -458,6 +626,13 @@ if __name__ == '__main__':
             download_artist_discography(
                 url,
                 category=args.category,
+                force=force,
+                jobs=max(1, args.jobs),
+                override_artist=args.override_artist,
+            )
+        elif _playlist_id_from_input(url):
+            download_music_playlist(
+                url,
                 force=force,
                 jobs=max(1, args.jobs),
                 override_artist=args.override_artist,
