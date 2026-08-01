@@ -74,6 +74,18 @@ def _join_artists(artists):
     return ', '.join(names) if names else None
 
 
+def _short_error(error):
+    """Return a concise, user-readable error without dumping API internals."""
+    if isinstance(error, KeyError):
+        return 'YouTube Music returned an unexpected page layout'
+    message = str(error).splitlines()[0].strip()
+    if not message:
+        return type(error).__name__
+    if len(message) > 140:
+        message = message[:137] + '...'
+    return f'{type(error).__name__}: {message}'
+
+
 def _download_track(url, opts, label, progress):
     """Worker for concurrent downloads. Returns True on success."""
     try:
@@ -87,8 +99,74 @@ def _download_track(url, opts, label, progress):
     except Exception as e:
         with progress['lock']:
             progress['done'] += 1
-            print(f'  [{progress["done"]}/{progress["total"]}] FAILED: {label} — {e}')
+            reason = _short_error(e)
+            progress['failures'].append((label, reason))
+            print(f'  [{progress["done"]}/{progress["total"]}] FAILED: {label} — {reason}')
         return False
+
+
+def _get_artist_section_releases(ytmusic, artist_id, section, label):
+    """Return releases from an artist section without crashing on YT layout changes."""
+    releases = []
+    seen = set()
+
+    def add_items(items):
+        for item in items or []:
+            browse_id = item.get('browseId')
+            if browse_id and browse_id not in seen:
+                releases.append(item)
+                seen.add(browse_id)
+
+    # get_artist() usually includes the first page already. Keep it as a safe
+    # fallback because get_artist_albums() can break when YouTube returns a
+    # musicShelfRenderer instead of the carousel/grid ytmusicapi expects.
+    add_items(section.get('results', []))
+
+    if section.get('params'):
+        try:
+            add_items(ytmusic.get_artist_albums(artist_id, section['params']))
+        except Exception as e:
+            reason = _short_error(e)
+            if releases:
+                print(f'  Warning: could not fetch more {label}; using listed results. {reason}.')
+            else:
+                print(f'  Warning: could not fetch {label}. {reason}.')
+
+    return releases
+
+
+def _fallback_album_from_artist_songs(release, artist_info, artist_name):
+    """Build a one-track release from get_artist()['songs'] if get_album() fails."""
+    songs_section = artist_info.get('songs') or {}
+    songs = songs_section.get('results', []) if isinstance(songs_section, dict) else []
+    browse_id = release.get('browseId')
+    release_title = release.get('title') or 'Unknown'
+
+    for song in songs:
+        album = song.get('album') or {}
+        album_matches = browse_id and album.get('id') == browse_id
+        title_matches = song.get('title') == release_title or album.get('name') == release_title
+        if not (album_matches or title_matches):
+            continue
+
+        video_id = song.get('videoId')
+        if not video_id:
+            continue
+
+        artists = song.get('artists') or [{'name': artist_name, 'id': None}]
+        return {
+            'title': album.get('name') or release_title,
+            'type': release.get('type') or 'Single',
+            'year': release.get('year') or '',
+            'artists': artists,
+            'tracks': [{
+                'videoId': video_id,
+                'title': song.get('title') or release_title,
+                'artists': artists,
+            }],
+        }
+
+    return None
 
 
 def download_artist_discography(artist_query, category='all', output_path='downloads',
@@ -142,21 +220,15 @@ def download_artist_discography(artist_query, category='all', output_path='downl
     need_albums_section = category in ('albums', 'eps', 'all')
     need_singles_section = category in ('singles', 'eps', 'all')
 
-    if need_albums_section and 'albums' in artist_info:
-        section = artist_info['albums']
-        if 'params' in section:
-            items = ytmusic.get_artist_albums(artist_id, section['params'])
-        else:
-            items = section.get('results', [])
-        raw_releases.extend(items)
+    if need_albums_section and artist_info.get('albums'):
+        raw_releases.extend(
+            _get_artist_section_releases(ytmusic, artist_id, artist_info['albums'], 'albums')
+        )
 
-    if need_singles_section and 'singles' in artist_info:
-        section = artist_info['singles']
-        if 'params' in section:
-            items = ytmusic.get_artist_albums(artist_id, section['params'])
-        else:
-            items = section.get('results', [])
-        raw_releases.extend(items)
+    if need_singles_section and artist_info.get('singles'):
+        raw_releases.extend(
+            _get_artist_section_releases(ytmusic, artist_id, artist_info['singles'], 'singles')
+        )
 
     if not raw_releases:
         print('No releases found for the selected category.')
@@ -175,6 +247,8 @@ def download_artist_discography(artist_query, category='all', output_path='downl
 
     # --- gather phase: collect every track as a download task ---
     tasks = []  # list of (url, opts, label)
+    skipped_releases = []  # list of (title, browse_id, reason)
+    skipped_tracks = []  # list of (release_title, track_title, reason)
     release_count = 0
 
     for release in raw_releases:
@@ -182,11 +256,18 @@ def download_artist_discography(artist_query, category='all', output_path='downl
         if not browse_id:
             continue
 
+        release_title = release.get('title') or browse_id
         try:
             album_info = ytmusic.get_album(browse_id)
         except Exception as e:
-            print(f'  Skipping release (fetch failed): {e}')
-            continue
+            album_info = _fallback_album_from_artist_songs(release, artist_info, artist_name)
+            if album_info:
+                print(f'  Warning: album details unavailable for "{release_title}"; using artist song listing fallback.')
+            else:
+                reason = _short_error(e)
+                skipped_releases.append((release_title, browse_id, reason))
+                print(f'  Skipping release: {release_title} ({browse_id}) — {reason}')
+                continue
 
         release_type = album_info.get('type', 'Album')
         if release_type not in allowed_types:
@@ -196,6 +277,8 @@ def download_artist_discography(artist_query, category='all', output_path='downl
         year = album_info.get('year', '')
         tracks = album_info.get('tracks', [])
         if not tracks:
+            skipped_releases.append((title, browse_id, 'No tracks found in release'))
+            print(f'  Skipping release: {title} ({browse_id}) — no tracks found')
             continue
 
         safe_title = sanitize_filename(title)
@@ -212,6 +295,9 @@ def download_artist_discography(artist_query, category='all', output_path='downl
         for i, track in enumerate(tracks, 1):
             video_id = track.get('videoId')
             if not video_id:
+                track_title_raw = track.get('title', 'Unknown')
+                skipped_tracks.append((title, track_title_raw, 'No video id found'))
+                print(f'    Skipping track: {title} — {track_title_raw} (no video id found)')
                 continue
             track_title_raw = track.get('title', 'Unknown')
             track_title = sanitize_filename(track_title_raw)
@@ -259,6 +345,7 @@ def download_artist_discography(artist_query, category='all', output_path='downl
         'done': 0,
         'total': len(tasks),
         'lock': threading.Lock(),
+        'failures': [],
     }
 
     if concurrent:
@@ -275,7 +362,17 @@ def download_artist_discography(artist_query, category='all', output_path='downl
                 successes += 1
 
     print(f'\n{"=" * 60}')
-    print(f'Done! {successes}/{len(tasks)} track(s) downloaded.')
+    print(f'Done! {successes}/{len(tasks)} queued track(s) completed.')
+    if skipped_releases or skipped_tracks or progress['failures']:
+        print('\nSome items were not downloaded:')
+        for title, browse_id, reason in skipped_releases:
+            print(f'  Release skipped: {title} ({browse_id}) — {reason}')
+        for release_title, track_title, reason in skipped_tracks:
+            print(f'  Track skipped: {release_title} — {track_title} — {reason}')
+        for label, reason in progress['failures']:
+            print(f'  Download failed: {label} — {reason}')
+    else:
+        print('No skipped releases or failed downloads reported.')
     print(f'Files saved to: {output_path}/{safe_artist}/')
     print('=' * 60)
 
