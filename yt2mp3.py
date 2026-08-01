@@ -32,8 +32,16 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
     else:
         postprocessors.append({'key': 'FFmpegMetadata'})
 
+    # Write and embed the YouTube Music thumbnail so imports into iTunes/Music
+    # show cover art on the MP3 files.
+    postprocessors.extend([
+        {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'},
+        {'key': 'EmbedThumbnail'},
+    ])
+
     opts = {
         'format': 'bestaudio/best',
+        'writethumbnail': True,
         'postprocessors': postprocessors,
         'paths': {'home': output_path},
         'outtmpl': {'default': outtmpl or '%(title)s.%(ext)s'},
@@ -45,6 +53,7 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
         'nocheckcertificate': False,
         'quiet': quiet,
         'no_warnings': quiet,
+        'noprogress': quiet,
     }
 
     if pp_args:
