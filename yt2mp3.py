@@ -366,7 +366,7 @@ def download_artist_discography(artist_query, category='all', output_path='downl
         artist_id = artist['browseId']
         artist_name = artist['artist']
 
-    safe_artist = sanitize_filename(artist_name)
+    safe_artist = sanitize_filename(override_artist or artist_name)
 
     print(f'\nFetching discography for {artist_name}...\n')
     artist_info = ytmusic.get_artist(artist_id)
