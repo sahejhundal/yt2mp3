@@ -7,6 +7,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import yt_dlp
 
 
+try:
+    sys.stdout.reconfigure(errors='replace')
+    sys.stderr.reconfigure(errors='replace')
+except Exception:
+    pass
+
+
 def sanitize_filename(name):
     """Remove or replace characters that are invalid in filenames."""
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
