@@ -114,6 +114,9 @@ python yt2mp3.py --complete \
 - Pass **multiple channel URLs** to merge aliases of one artist; tracks are
   de-duplicated globally by title (use `--keep-duplicates` to keep every upload).
 - Files land flat in `downloads/<Artist Name>/`.
+- `--folder "Name"` sets the output folder (defaults to `--override-artist`);
+  `--album "Name"` sets the album tag (default `Singles`). Handy for keeping a
+  side collection separate, e.g. `--folder "Artist Vault" --album "Vault"`.
 
 #### One-shot: download + clean + dedupe
 

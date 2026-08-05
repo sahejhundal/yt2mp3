@@ -759,7 +759,9 @@ def build_parser():
         epilog='Examples:\n'
                '  python yt2mp3.py "https://youtube.com/watch?v=ID"\n'
                '  python yt2mp3.py --artist "Kendrick Lamar" --category albums\n'
-               '  python yt2mp3.py -a "Frank Ocean" -c singles -f\n',
+               '  python yt2mp3.py -a "Frank Ocean" -c singles -f\n'
+               '  python yt2mp3.py --complete "https://music.youtube.com/channel/UCxxxx" \\\n'
+               '      --override-artist "Name" --cookies cookies.json --clean --dedupe\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('url', nargs='?', default=None,
