@@ -15,6 +15,11 @@ A simple Python script to download YouTube videos and playlists as high-quality 
 
 - Python 3.6+
 - FFmpeg (for audio conversion)
+- **Deno** (JavaScript runtime) — required so yt-dlp can solve YouTube's
+  signature / n-sig challenges. Without it, some tracks return only storyboard
+  images ("Only images are available for download"). Install with
+  `brew install deno` (macOS) and make sure `deno` is on your `PATH`.
+  Also install the solver scripts: `pip install -U --pre "yt-dlp[default]"`.
 
 ## Installation
 
@@ -89,6 +94,40 @@ python yt2mp3.py -a "The Weeknd" -c all -f
 ```
 
 Files are organized as `downloads/Artist/Release Name/01 - Track.mp3`.
+
+### Complete Catalogue (robust — never misses a track)
+
+YouTube Music's artist pages sometimes fail to parse (ytmusicapi raises
+`musicImmersiveHeaderRenderer` / `musicCarouselShelfRenderer` errors), which
+makes the discography mode silently skip singles — or an entire artist. The
+`--complete` mode bypasses ytmusicapi entirely and enumerates each channel's
+auto-generated **"Uploads from …"** playlist with yt-dlp, so every single,
+album track and video is captured even if it was just released.
+
+```bash
+python yt2mp3.py --complete \
+  "https://music.youtube.com/channel/UCxxxx" \
+  "https://music.youtube.com/channel/UCyyyy" \
+  --override-artist "Artist Name"
+```
+
+- Pass **multiple channel URLs** to merge aliases of one artist; tracks are
+  de-duplicated globally by title (use `--keep-duplicates` to keep every upload).
+- Files land flat in `downloads/<Artist Name>/`.
+
+### Age-restricted tracks (cookies)
+
+Some tracks require a logged-in account. Pass cookies with `--cookies`, which
+accepts **either** a Netscape `cookies.txt` **or** a browser-extension JSON
+export (auto-converted):
+
+```bash
+python yt2mp3.py --complete "https://music.youtube.com/channel/UCxxxx" \
+  --override-artist "Artist Name" --cookies cookies.json
+```
+
+Each concurrent worker gets a private copy of the cookies so the file is never
+corrupted by yt-dlp's token refresh. `cookies.txt`/`cookies.json` are gitignored.
 
 ## Output
 

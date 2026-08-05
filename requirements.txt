@@ -1,3 +1,6 @@
-yt-dlp==2025.12.8
+# The [default] extra pulls in yt-dlp-ejs, needed (together with a JS runtime
+# such as Deno) to solve YouTube's signature / n-sig challenges. Without it
+# some tracks return only storyboard images.
+yt-dlp[default]
 ytmusicapi
 certifi

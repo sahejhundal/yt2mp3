@@ -20,6 +20,41 @@ def sanitize_filename(name):
     return name.strip('. ')
 
 
+COOKIES_FILE = None
+
+
+def _cookies_json_to_netscape(json_path):
+    """Convert a browser-extension JSON cookie export to a Netscape cookies.txt.
+
+    Returns the path to a generated temp cookies.txt. Accepts either a raw list
+    of cookie dicts or an object with a 'cookies' list.
+    """
+    import json
+    import tempfile
+    with open(json_path, encoding='utf-8') as fh:
+        data = json.load(fh)
+    if isinstance(data, dict):
+        data = data.get('cookies', [])
+
+    lines = ['# Netscape HTTP Cookie File', '']
+    for c in data:
+        domain = c.get('domain', '')
+        if not domain or not c.get('name'):
+            continue
+        flag = 'TRUE' if domain.startswith('.') else 'FALSE'
+        secure = 'TRUE' if c.get('secure') else 'FALSE'
+        expiry = int(c.get('expirationDate') or c.get('expires') or 0)
+        lines.append('\t'.join([
+            domain, flag, c.get('path', '/'), secure,
+            str(expiry), c.get('name', ''), c.get('value', ''),
+        ]))
+
+    fd, tmp = tempfile.mkstemp(prefix='ytcookies_src_', suffix='.txt')
+    with os.fdopen(fd, 'w', encoding='utf-8') as out:
+        out.write('\n'.join(lines) + '\n')
+    return tmp
+
+
 def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
                   metadata=None, quiet=False):
     postprocessors = [{
@@ -56,7 +91,9 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
         'download_archive': archive_path or os.path.join(output_path, '.downloaded.txt'),
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'referer': 'https://www.youtube.com/',
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        # Let yt-dlp choose clients; with a JS runtime (Deno) available it solves
+        # the signature/n challenges and returns progressive audio. Forcing
+        # web_safari here previously produced empty HLS downloads.
         'nocheckcertificate': False,
         'quiet': quiet,
         'no_warnings': quiet,
@@ -65,6 +102,16 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
 
     if pp_args:
         opts['postprocessor_args'] = pp_args
+    if COOKIES_FILE:
+        # yt-dlp rewrites the cookie file with refreshed tokens on close, so a
+        # shared file corrupts under concurrent workers. Give each download its
+        # own private copy to read/write safely.
+        import tempfile
+        import shutil
+        fd, tmp_cookies = tempfile.mkstemp(prefix='ytcookies_', suffix='.txt')
+        os.close(fd)
+        shutil.copyfile(COOKIES_FILE, tmp_cookies)
+        opts['cookiefile'] = tmp_cookies
     if force:
         opts.pop('download_archive', None)
     return opts
@@ -91,6 +138,157 @@ def _playlist_id_from_input(value):
     if re.fullmatch(r'(?:OLAK5uy_[\w-]+|VL[\w-]+|PL[\w-]+|RD[\w-]+)', value):
         return value
     return None
+
+
+def _uploads_playlist_id(value):
+    """Return the 'Uploads from ...' playlist id (UU...) for a channel.
+
+    Every YouTube channel has an auto-generated uploads playlist whose id is
+    the channel id with the leading 'UC' swapped for 'UU'. For a YouTube Music
+    '... - Topic' channel this playlist lists the artist's ENTIRE catalogue
+    (every single, album track and video), which is far more reliable than
+    ytmusicapi's get_artist()/get_artist_albums() parsing that breaks whenever
+    YouTube changes the artist page layout.
+    """
+    channel_id = _channel_id_from_input(value)
+    if channel_id:
+        return 'UU' + channel_id[2:]
+    return None
+
+
+def _normalize_title_key(title, aliases=()):
+    """Return a loose comparison key for de-duplicating tracks by title."""
+    text = (title or '').lower()
+    for alias in aliases:
+        alias = (alias or '').strip().lower()
+        if alias:
+            text = re.sub(r'^\s*' + re.escape(alias) + r'\s*[-\u2013\u2014~:]+\s*', '', text)
+    text = re.sub(r'[\(\[\{].*?[\)\]\}]', '', text)  # drop bracketed tags
+    text = re.sub(r'[^a-z0-9]+', ' ', text).strip()
+    return text
+
+
+def list_channel_tracks(channel_or_url):
+    """Return [(video_id, title), ...] for every upload on a channel.
+
+    Uses yt-dlp's flat playlist extraction on the channel's uploads playlist so
+    it never depends on the YouTube Music artist-page layout.
+    """
+    uploads_id = _uploads_playlist_id(channel_or_url)
+    if uploads_id:
+        target = f'https://www.youtube.com/playlist?list={uploads_id}'
+    else:
+        target = channel_or_url
+
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'skip_download': True,
+        'ignoreerrors': True,
+    }
+    if COOKIES_FILE:
+        opts['cookiefile'] = COOKIES_FILE
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+
+    tracks = []
+    seen = set()
+    for entry in (info or {}).get('entries') or []:
+        if not entry:
+            continue
+        vid = entry.get('id')
+        title = entry.get('title')
+        if not vid or not title:
+            continue
+        if title in ('[Private video]', '[Deleted video]', '[Unavailable video]'):
+            continue
+        if vid in seen:
+            continue
+        seen.add(vid)
+        tracks.append((vid, title))
+    return tracks
+
+
+def download_channels_complete(channels, override_artist=None, output_path='downloads',
+                               force=False, jobs=4, dedup_title=True,
+                               album_name='Singles', folder_name=None):
+    """Download the COMPLETE catalogue of one or more channels.
+
+    This bypasses ytmusicapi entirely and enumerates each channel's uploads
+    playlist with yt-dlp, so newly released or oddly-attached tracks (e.g. a
+    single that only lives on the '... - Topic' channel) are never missed.
+    When several channels belong to the same artist, pass them together so the
+    catalogue is de-duplicated globally by title.
+    """
+    if isinstance(channels, str):
+        channels = [channels]
+
+    artist_label = folder_name or override_artist or 'Unknown Artist'
+    safe_artist = sanitize_filename(artist_label)
+    archive_path = os.path.join(output_path, safe_artist, '.downloaded.txt')
+    release_path = os.path.join(output_path, safe_artist)
+    os.makedirs(release_path, exist_ok=True)
+
+    aliases = [override_artist or '', 'nine vicious', 'fostijs', 'sosa', 'fn']
+
+    tasks = []
+    skipped_tracks = []
+    seen_ids = set()
+    seen_titles = {}
+    collapsed = []
+    catalogue = []  # (video_id, title, channel) of everything queued
+
+    for channel in channels:
+        try:
+            tracks = list_channel_tracks(channel)
+        except Exception as e:
+            print(f'  Warning: could not enumerate {channel}: {_short_error(e)}')
+            continue
+
+        print(f'  {channel}: {len(tracks)} upload(s) found')
+        for vid, raw_title in tracks:
+            if vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+
+            if dedup_title:
+                key = _normalize_title_key(raw_title, aliases)
+                if key and key in seen_titles:
+                    collapsed.append((raw_title, seen_titles[key]))
+                    continue
+                if key:
+                    seen_titles[key] = raw_title
+
+            catalogue.append((vid, raw_title, channel))
+            safe_title = sanitize_filename(raw_title)
+            url = f'https://music.youtube.com/watch?v={vid}'
+            outtmpl = f'{safe_title}.%(ext)s'
+            metadata = {
+                'title': raw_title,
+                'artist': override_artist or artist_label,
+                'album_artist': override_artist or artist_label,
+                'album': album_name,
+            }
+            opts = make_ydl_opts(
+                release_path,
+                force=force,
+                outtmpl=outtmpl,
+                archive_path=archive_path,
+                metadata=metadata,
+                quiet=jobs > 1,
+            )
+            tasks.append((url, opts, raw_title))
+
+    if collapsed:
+        print(f'\n  Collapsed {len(collapsed)} duplicate-title upload(s) '
+              f'(use --keep-duplicates to keep them all).')
+
+    _run_download_tasks(
+        tasks, 1, [], skipped_tracks,
+        output_path, safe_artist, jobs,
+    )
+    return catalogue
 
 
 def _join_artists(artists):
@@ -579,6 +777,24 @@ def build_parser():
                         help='which release types to download (default: all)')
     parser.add_argument('-j', '--jobs', type=int, default=4,
                         help='concurrent downloads (default: 4, use 1 for sequential)')
+    parser.add_argument('--complete', action='store_true',
+                        help='robustly download a channel\'s ENTIRE catalogue via its '
+                             'uploads playlist (bypasses ytmusicapi; never misses tracks). '
+                             'Accepts one or more channel URLs/ids as positional args.')
+    parser.add_argument('channels', nargs='*', default=None,
+                        help='additional channel URLs/ids for --complete mode')
+    parser.add_argument('--keep-duplicates', action='store_true',
+                        help='in --complete mode, keep every upload instead of collapsing '
+                             'tracks that share a title across releases/channels')
+    parser.add_argument('--folder', default=None,
+                        help='in --complete mode, output folder name under downloads/ '
+                             '(defaults to --override-artist)')
+    parser.add_argument('--album', default='Singles',
+                        help='in --complete mode, album tag for the tracks (default: Singles)')
+    parser.add_argument('--cookies', default=None,
+                        help='path to cookies for age-restricted tracks: either a Netscape '
+                             'cookies.txt or a browser-extension JSON export (auto-converted). '
+                             'Use youtube.com cookies from a logged-in account.')
     return parser
 
 
@@ -586,7 +802,34 @@ if __name__ == '__main__':
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.artist:
+    if args.cookies:
+        cookies_path = os.path.abspath(os.path.expanduser(args.cookies))
+        if not os.path.exists(cookies_path):
+            print(f'Cookies file not found: {cookies_path}')
+            sys.exit(1)
+        # Accept a browser JSON export and convert it transparently.
+        if cookies_path.lower().endswith('.json'):
+            COOKIES_FILE = _cookies_json_to_netscape(cookies_path)
+            print(f'Converted JSON cookies -> {COOKIES_FILE}')
+        else:
+            COOKIES_FILE = cookies_path
+
+    if args.complete:
+        channels = [c for c in ([args.url] + (args.channels or [])) if c]
+        if not channels:
+            print('Provide at least one channel URL/id with --complete.')
+            sys.exit(1)
+        print(f'\nComplete catalogue download for {len(channels)} channel(s)...\n')
+        download_channels_complete(
+            channels,
+            override_artist=args.override_artist,
+            force=args.force,
+            jobs=max(1, args.jobs),
+            dedup_title=not args.keep_duplicates,
+            album_name=args.album,
+            folder_name=args.folder,
+        )
+    elif args.artist:
         download_artist_discography(
             args.artist,
             category=args.category,
