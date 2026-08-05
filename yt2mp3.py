@@ -2,6 +2,7 @@ import sys
 import os
 import re
 import argparse
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yt_dlp
@@ -795,7 +796,38 @@ def build_parser():
                         help='path to cookies for age-restricted tracks: either a Netscape '
                              'cookies.txt or a browser-extension JSON export (auto-converted). '
                              'Use youtube.com cookies from a logged-in account.')
+    parser.add_argument('--clean', action='store_true',
+                        help='after downloading, run clean_mp3_metadata.py on the output '
+                             'folder (normalise titles, set artist, rename files)')
+    parser.add_argument('--dedupe', action='store_true',
+                        help='after downloading, run dedupe_audio.py on the output folder '
+                             'and QUARANTINE acoustic duplicates (safe/reversible)')
+    parser.add_argument('--dedupe-delete', action='store_true',
+                        help='with --dedupe, delete duplicates instead of quarantining them')
     return parser
+
+
+def _run_post_steps(output_folder, artist, do_clean, do_dedupe, dedupe_delete):
+    """Optionally run metadata cleaning and acoustic de-duplication."""
+    if not (do_clean or do_dedupe):
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    if do_clean:
+        print(f'\n=== Cleaning metadata in {output_folder} ===')
+        cmd = [sys.executable, os.path.join(here, 'clean_mp3_metadata.py'),
+               output_folder, '--set-artist', '--rename-files', '--apply']
+        if artist:
+            cmd[3:3] = ['--artist', artist]
+        subprocess.run(cmd)
+    if do_dedupe:
+        print(f'\n=== De-duplicating audio in {output_folder} ===')
+        cmd = [sys.executable, os.path.join(here, 'dedupe_audio.py'),
+               output_folder, '--apply']
+        if dedupe_delete:
+            cmd.append('--delete')
+        subprocess.run(cmd)
+        print('Note: cross-folder duplicates are only found when you pass several '
+              'folders to dedupe_audio.py directly.')
 
 
 if __name__ == '__main__':
@@ -829,6 +861,10 @@ if __name__ == '__main__':
             album_name=args.album,
             folder_name=args.folder,
         )
+        out_folder = os.path.join(
+            'downloads', sanitize_filename(args.folder or args.override_artist or 'Unknown Artist'))
+        _run_post_steps(out_folder, args.override_artist, args.clean,
+                        args.dedupe, args.dedupe_delete)
     elif args.artist:
         download_artist_discography(
             args.artist,

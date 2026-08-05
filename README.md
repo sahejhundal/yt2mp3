@@ -115,6 +115,22 @@ python yt2mp3.py --complete \
   de-duplicated globally by title (use `--keep-duplicates` to keep every upload).
 - Files land flat in `downloads/<Artist Name>/`.
 
+#### One-shot: download + clean + dedupe
+
+Add `--clean` and/or `--dedupe` to run the post-processing automatically on the
+output folder right after downloading:
+
+```bash
+python yt2mp3.py --complete "https://music.youtube.com/channel/UCxxxx" \
+  --override-artist "Artist Name" --clean --dedupe
+```
+
+- `--clean` → runs `clean_mp3_metadata.py` (normalise titles, set artist, rename).
+- `--dedupe` → runs `dedupe_audio.py` and **quarantines** acoustic duplicates
+  (reversible). Add `--dedupe-delete` to delete them instead.
+- Auto-dedupe only scans the freshly downloaded folder. To catch duplicates
+  **across** folders/artists, run `dedupe_audio.py` manually with several paths.
+
 ### Age-restricted tracks (cookies)
 
 Some tracks require a logged-in account. Pass cookies with `--cookies`, which
