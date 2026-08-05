@@ -129,6 +129,43 @@ python yt2mp3.py --complete "https://music.youtube.com/channel/UCxxxx" \
 Each concurrent worker gets a private copy of the cookies so the file is never
 corrupted by yt-dlp's token refresh. `cookies.txt`/`cookies.json` are gitignored.
 
+## De-duplicating by audio (dedupe_audio.py)
+
+Metadata lies — the same recording can show up under different titles, artists
+or folders. `dedupe_audio.py` matches tracks by their **acoustic fingerprint**
+(Chromaprint / AcoustID tech), so it finds true duplicates regardless of tags,
+bitrate or filename, while keeping remixes and "slowed + reverb" edits separate.
+It runs fully offline, so it also works on unreleased/leaked tracks.
+
+Install the fingerprinter once:
+
+```bash
+brew install chromaprint        # provides `fpcalc`
+```
+
+Usage:
+
+```bash
+# Dry-run report across one or more folders (nothing is changed)
+python dedupe_audio.py "downloads/Nine Vicious" "downloads/Nine Vicious Vault"
+
+# Quarantine duplicates into <root>/_duplicates (safe; reversible)
+python dedupe_audio.py "downloads" --apply
+
+# Actually delete duplicates
+python dedupe_audio.py "downloads" --apply --delete
+
+# Prefer which copy survives, and tune strictness
+python dedupe_audio.py "downloads/Nine Vicious" "downloads/Nine Vicious Vault" \
+  --prefer "Nine Vicious/,Vault" --threshold 0.92
+```
+
+How it decides: two files are the same recording when their fingerprints match
+above `--threshold` (default `0.90`). In practice real duplicates score
+93–99%+ while different songs stay below ~75%, leaving a wide safe margin. The
+kept copy is chosen by `--prefer` folder order, then highest bitrate, then
+largest file. Fingerprints are cached in `.fingerprints.json` for fast re-runs.
+
 ## Output
 
 Downloaded files are saved to the `downloads/` folder in the same directory as the script. Files are named using the video title.

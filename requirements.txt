@@ -4,3 +4,5 @@
 yt-dlp[default]
 ytmusicapi
 certifi
+# Used by dedupe_audio.py to read bitrate/tags when choosing which copy to keep.
+mutagen

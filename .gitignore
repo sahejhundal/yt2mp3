@@ -6,3 +6,4 @@ downloads/
 cookies.txt
 cookies.json
 *.cookies.txt
+.fingerprints.json
