@@ -56,6 +56,23 @@ def _cookies_json_to_netscape(json_path):
     return tmp
 
 
+def _js_challenge_opts():
+    """Options that help yt-dlp solve YouTube signature/n-sig challenges."""
+    return {
+        'js_runtimes': {'node': {}, 'deno': {}},
+        'remote_components': ['ejs:github'],
+    }
+
+
+def _metadata_probe_opts():
+    """Auth/challenge options for single metadata probes."""
+    opts = {'quiet': True, 'no_warnings': True}
+    if COOKIES_FILE:
+        opts['cookiefile'] = COOKIES_FILE
+        opts.update(_js_challenge_opts())
+    return opts
+
+
 def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
                   metadata=None, quiet=False):
     postprocessors = [{
@@ -113,13 +130,52 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
         os.close(fd)
         shutil.copyfile(COOKIES_FILE, tmp_cookies)
         opts['cookiefile'] = tmp_cookies
+        opts.update(_js_challenge_opts())
     if force:
         opts.pop('download_archive', None)
     return opts
 
 
-def download_youtube_audio(url, output_path='downloads', force=False):
-    opts = make_ydl_opts(output_path, force=force)
+def download_youtube_audio(url, output_path='downloads', force=False, override_artist=None):
+    if not override_artist:
+        opts = make_ydl_opts(output_path, force=force)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        return
+
+    try:
+        with yt_dlp.YoutubeDL(_metadata_probe_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        print(f'Could not read video metadata: {_short_error(e)}')
+        return
+
+    title = info.get('track') or info.get('title') or info.get('id') or 'Unknown'
+    album = info.get('album') or title
+    year = info.get('release_year') or str(info.get('upload_date') or '')[:4]
+    safe_artist = sanitize_filename(override_artist)
+    safe_album = sanitize_filename(album)
+    track_title = sanitize_filename(title)
+    release_path = os.path.join(output_path, safe_artist, safe_album)
+    archive_path = os.path.join(output_path, safe_artist, '.downloaded.txt')
+    os.makedirs(release_path, exist_ok=True)
+
+    metadata = {
+        'title': title,
+        'artist': override_artist,
+        'album_artist': override_artist,
+        'album': album,
+        'track': '1/1',
+        'disc': '1/1',
+        'date': str(year) if year else '',
+    }
+    opts = make_ydl_opts(
+        release_path,
+        force=force,
+        outtmpl=f'01 - {track_title}.%(ext)s',
+        archive_path=archive_path,
+        metadata=metadata,
+    )
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
@@ -315,8 +371,14 @@ def _short_error(error):
 def _download_track(url, opts, label, progress):
     """Worker for concurrent downloads. Returns True on success."""
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        # Each worker downloads exactly one URL, so do not ignore errors here.
+        # Otherwise yt-dlp can print an ERROR while we incorrectly mark success.
+        worker_opts = dict(opts)
+        worker_opts['ignoreerrors'] = False
+        with yt_dlp.YoutubeDL(worker_opts) as ydl:
+            retcode = ydl.download([url])
+        if retcode:
+            raise RuntimeError(f'yt-dlp exited with code {retcode}')
         with progress['lock']:
             progress['done'] += 1
             pct = progress['done'] / progress['total'] * 100
@@ -891,7 +953,7 @@ if __name__ == '__main__':
             override_artist=args.override_artist,
         )
     elif args.url:
-        download_youtube_audio(args.url, force=args.force)
+        download_youtube_audio(args.url, force=args.force, override_artist=args.override_artist)
     else:
         raw = input('Enter YouTube URL (add --force to re-download): ').strip()
         if not raw:
@@ -926,4 +988,4 @@ if __name__ == '__main__':
                 override_artist=args.override_artist,
             )
         else:
-            download_youtube_audio(url, force=force)
+            download_youtube_audio(url, force=force, override_artist=args.override_artist)
