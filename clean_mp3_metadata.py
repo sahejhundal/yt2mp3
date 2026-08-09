@@ -102,33 +102,33 @@ def clean_bracket_content(content):
 
 
 def clean_title(title, aliases, drop_all_brackets=False):
-    title = title.replace('_', '/')
     title = strip_leading_artist(title, aliases)
-
-    kept_parts = []
 
     def bracket_repl(match):
         content = match.group(1) or match.group(2) or match.group(3) or ''
-        cleaned = clean_bracket_content(content)
-        if drop_all_brackets and not FEATURE_RE.search(content):
-            cleaned = ''
-        if cleaned:
-            kept_parts.append(cleaned)
-        return ' '
+        raw = normalize_spaces(content)
+        low = raw.lower()
+        # Features: keep the text but drop the brackets -> "feat. X".
+        if FEATURE_RE.search(raw):
+            return ' ' + raw + ' '
+        if drop_all_brackets:
+            return ' '
+        # Drop only KNOWN junk tags (official video/audio, prod credits, etc.).
+        if low in DROP_PHRASES or any(p in low for p in DROP_PHRASES):
+            return ' '
+        if low.startswith(('prod.', 'prod ', 'produced by')):
+            return ' '
+        # Otherwise keep the bracket text AS-IS so real subtitles survive
+        # (e.g. "(Interlude)", "(Japanese)", "(Pneumonia)").
+        return match.group(0)
 
-    # Remove (), [], and {} wrappers. Feature text is appended without brackets.
     title = re.sub(r'\(([^()]*)\)|\[([^\[\]]*)\]|\{([^{}]*)\}', bracket_repl, title)
 
-    # Remove trailing bare tags that are not bracketed.
+    # Remove any remaining bare (unbracketed) junk tags.
     title = re.sub(r'\b(?:official music video|official video|music video|official audio|visualizer|lyric video)\b', '', title, flags=re.IGNORECASE)
 
     title = normalize_spaces(title)
-    for part in kept_parts:
-        part = normalize_spaces(part)
-        if part and part.lower() not in title.lower():
-            title = normalize_spaces(f'{title} {part}')
-
-    return title or normalize_spaces(strip_leading_artist(title, aliases)) or 'Unknown'
+    return title or 'Unknown'
 
 
 def safe_filename(name):
