@@ -19,7 +19,8 @@ itunes_dedupe_report.txt
 itunes_full_clean_dryrun.txt
 media_title_dedupe_report.txt
 media_title_dupes.txt
-metadata_cleanup_dry_run.txtitunes_cleanup_dry_run.txt
+metadata_cleanup_dry_run.txt
+itunes_cleanup_dry_run.txt
 missing_artist_files.txt
 missing_from_downloads.txt
 new_songs_to_add.txt
