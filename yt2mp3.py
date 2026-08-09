@@ -1,11 +1,17 @@
 import sys
 import os
 import re
+import shutil
+import ssl
+import tempfile
+import urllib.request
 import argparse
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yt_dlp
+
+ART_ENABLED = True   # embed square album covers as the standard (disable: --no-art)
 
 
 try:
@@ -189,6 +195,10 @@ def download_youtube_audio(url, output_path='downloads', force=False, override_a
     )
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
+    try:
+        apply_square_covers(os.path.join(output_path, safe_artist))
+    except Exception:
+        pass
 
 
 def _channel_id_from_input(value):
@@ -497,6 +507,109 @@ def _fallback_album_from_artist_songs(release, artist_info, artist_name):
     return None
 
 
+def _album_tag(path):
+    r = subprocess.run(['ffprobe', '-v', 'error', '-show_entries',
+                        'format_tags=album', '-of', 'default=nw=1:nk=1', str(path)],
+                       capture_output=True)
+    return r.stdout.decode('utf-8', 'replace').strip()
+
+
+def _cover_norm(t):
+    s = (t or '').lower()
+    s = re.sub(r'[\(\[\{].*?[\)\]\}]', '', s)
+    s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
+    return s
+
+
+def _embed_cover(path, cover_jpg):
+    d = tempfile.mkdtemp(prefix='art_')
+    tmp = os.path.join(d, os.path.basename(path))
+    cmd = ['ffmpeg', '-y', '-v', 'error', '-i', str(path), '-i', cover_jpg,
+           '-map', '0:a', '-map', '1:0', '-c:a', 'copy', '-c:v', 'mjpeg',
+           '-id3v2_version', '3', '-disposition:v', 'attached_pic',
+           '-metadata:s:v', 'title=Album cover',
+           '-metadata:s:v', 'comment=Cover (front)', tmp]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        shutil.move(tmp, str(path))
+        return True
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def apply_square_covers(folder):
+    """Standard art step: replace 16:9 video thumbnails with the official square
+    album cover from YouTube Music when a matching release exists; otherwise
+    leave the existing thumbnail untouched."""
+    if not ART_ENABLED:
+        return
+    try:
+        from ytmusicapi import YTMusic
+    except ImportError:
+        return
+    root = folder
+    files = []
+    for dirpath, _dirs, names in os.walk(root):
+        if '_duplicates' in dirpath.split(os.sep):
+            continue
+        for n in names:
+            if n.lower().endswith('.mp3'):
+                files.append(os.path.join(dirpath, n))
+    if not files:
+        return
+
+    albums = {}
+    for f in files:
+        a = _album_tag(f)
+        if a and a.lower() != 'singles':
+            albums.setdefault(a, []).append(f)
+    if not albums:
+        return
+
+    try:
+        ctx = ssl.create_default_context(cafile=__import__('certifi').where())
+    except Exception:
+        ctx = ssl.create_default_context()
+    yt = YTMusic()
+    covers = {}
+    for album in albums:
+        url = None
+        try:
+            for r in yt.search(album, filter='albums', limit=5):
+                if _cover_norm(r.get('title')) == _cover_norm(album):
+                    alb = yt.get_album(r['browseId'])
+                    th = alb.get('thumbnails') or []
+                    if th:
+                        url = re.sub(r'w\d+-h\d+', 'w1200-h1200', th[-1]['url'])
+                    break
+        except Exception:
+            url = None
+        path = None
+        if url:
+            try:
+                data = urllib.request.urlopen(url, context=ctx, timeout=60).read()
+                fd, path = tempfile.mkstemp(prefix='cover_', suffix='.jpg')
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(data)
+            except Exception:
+                path = None
+        covers[album] = path
+
+    done = 0
+    for album, fs in albums.items():
+        cov = covers.get(album)
+        if not cov:
+            continue
+        for f in fs:
+            if _embed_cover(f, cov):
+                done += 1
+    if done:
+        print(f'  Embedded square album covers on {done} track(s) '
+              f'(others kept their thumbnail).')
+
+
 def _run_download_tasks(tasks, release_count, skipped_releases, skipped_tracks,
                         output_path, safe_artist, jobs):
     if not tasks:
@@ -542,6 +655,11 @@ def _run_download_tasks(tasks, release_count, skipped_releases, skipped_tracks,
         print('No skipped releases or failed downloads reported.')
     print(f'Files saved to: {output_path}/{safe_artist}/')
     print('=' * 60)
+    # Standard art step: prefer square album covers, fall back to the thumbnail.
+    try:
+        apply_square_covers(os.path.join(output_path, safe_artist))
+    except Exception as e:
+        print(f'  (square-cover step skipped: {_short_error(e)})')
     return not (skipped_releases or skipped_tracks or progress['failures'])
 
 
@@ -883,6 +1001,9 @@ def build_parser():
                              'and QUARANTINE acoustic duplicates (safe/reversible)')
     parser.add_argument('--dedupe-delete', action='store_true',
                         help='with --dedupe, delete duplicates instead of quarantining them')
+    parser.add_argument('--no-art', action='store_true',
+                        help='do NOT replace video thumbnails with square album covers '
+                             '(by default the square cover is used when a release exists)')
     return parser
 
 
@@ -912,6 +1033,9 @@ def _run_post_steps(output_folder, artist, do_clean, do_dedupe, dedupe_delete):
 if __name__ == '__main__':
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.no_art:
+        ART_ENABLED = False
 
     if args.cookies:
         cookies_path = os.path.abspath(os.path.expanduser(args.cookies))
