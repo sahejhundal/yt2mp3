@@ -6,3 +6,5 @@ ytmusicapi
 certifi
 # Used by dedupe_audio.py to read bitrate/tags when choosing which copy to keep.
 mutagen
+# Used by audio_quality.py for spectral (FFT) analysis of real audio quality.
+numpy
