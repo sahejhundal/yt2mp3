@@ -207,6 +207,96 @@ def _channel_id_from_input(value):
     return match.group(1) if match else None
 
 
+def _is_soundcloud(value):
+    return 'soundcloud.com' in (value or '').lower()
+
+
+def _soundcloud_kind(value):
+    """Classify a SoundCloud URL: 'set', 'artist', or 'track'."""
+    v = (value or '').split('?')[0].rstrip('/')
+    if '/sets/' in v:
+        return 'set'
+    # soundcloud.com/<user>  (optionally /tracks, /popular-tracks, /albums)
+    m = re.match(r'https?://(?:www\.|m\.)?soundcloud\.com/([^/]+)(/[^/]+)?$', v)
+    if m:
+        tail = (m.group(2) or '').lower()
+        if tail in ('', '/tracks', '/popular-tracks', '/albums', '/sets', '/reposts', '/likes'):
+            return 'artist'
+    return 'track'
+
+
+def download_soundcloud(url, output_path='downloads', force=False, jobs=4,
+                        override_artist=None, album_name=None):
+    """Download a SoundCloud track, set/album, or whole artist via yt-dlp.
+
+    SoundCloud artwork is already square, so cover art comes out clean without
+    the YouTube video-thumbnail problem. All the usual options apply
+    (--override-artist, -j, -f).
+    """
+    kind = _soundcloud_kind(url)
+    target = url
+    if kind == 'artist' and not re.search(r'/(tracks|albums|sets|likes|reposts|popular-tracks)$', url.split('?')[0].rstrip('/')):
+        target = url.split('?')[0].rstrip('/') + '/tracks'
+
+    print(f'\nFetching SoundCloud {kind}: {url}\n')
+    probe = {'quiet': True, 'no_warnings': True, 'ignoreerrors': True}
+    if kind == 'track':
+        probe['skip_download'] = True
+    else:
+        probe.update({'extract_flat': False, 'skip_download': True})
+    try:
+        with yt_dlp.YoutubeDL(probe) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except Exception as e:
+        print(f'Could not read SoundCloud page: {_short_error(e)}')
+        return
+
+    entries = info.get('entries')
+    if entries is None:            # single track
+        entries = [info]
+    entries = [e for e in entries if e]
+
+    set_title = info.get('title') if kind == 'set' else None
+    uploader = info.get('uploader') or (entries[0].get('uploader') if entries else None)
+    artist_label = override_artist or uploader or 'Unknown Artist'
+    safe_artist = sanitize_filename(artist_label)
+    release_path = os.path.join(output_path, safe_artist)
+    archive_path = os.path.join(release_path, '.downloaded.txt')
+    os.makedirs(release_path, exist_ok=True)
+
+    tasks = []
+    for e in entries:
+        title = e.get('title') or str(e.get('id'))
+        turl = e.get('webpage_url') or e.get('url')
+        if not turl:
+            continue
+        album = album_name or set_title or 'Singles'
+        safe = sanitize_filename(title)
+        metadata = {
+            'title': title,
+            'artist': override_artist or e.get('uploader') or artist_label,
+            'album_artist': override_artist or artist_label,
+            'album': album,
+            'date': str(e.get('release_year') or ''),
+        }
+        opts = make_ydl_opts(release_path, force=force, outtmpl=f'{safe}.%(ext)s',
+                             archive_path=archive_path, metadata=metadata,
+                             quiet=jobs > 1)
+        tasks.append((turl, opts, title))
+
+    if not tasks:
+        print('No SoundCloud tracks found.')
+        return
+    # SoundCloud already gives square art; the YTMusic art step isn't relevant.
+    global ART_ENABLED
+    prev_art = ART_ENABLED
+    ART_ENABLED = False
+    try:
+        _run_download_tasks(tasks, 1, [], [], output_path, safe_artist, jobs)
+    finally:
+        ART_ENABLED = prev_art
+
+
 def _playlist_id_from_input(value):
     """Return a YouTube/YouTube Music playlist id from a URL or raw id."""
     value = value or ''
@@ -951,11 +1041,14 @@ def build_parser():
                '  python yt2mp3.py --artist "Kendrick Lamar" --category albums\n'
                '  python yt2mp3.py -a "Frank Ocean" -c singles -f\n'
                '  python yt2mp3.py --complete "https://music.youtube.com/channel/UCxxxx" \\\n'
-               '      --override-artist "Name" --cookies cookies.json --clean --dedupe\n',
+               '      --override-artist "Name" --cookies cookies.json --clean --dedupe\n'
+               '  python yt2mp3.py "https://soundcloud.com/user/sets/ep" --override-artist "Name"\n'
+               '  python yt2mp3.py "https://soundcloud.com/user" --override-artist "Name"   # whole artist\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('url', nargs='?', default=None,
-                        help='YouTube video URL, Music playlist/album URL, or Music channel '
+                        help='YouTube video/playlist/channel URL, or a SoundCloud track/'
+                             'set/artist URL; also a YouTube Music channel '
                              'URL to download a discography')
     parser.add_argument('-f', '--force', action='store_true',
                         help='re-download tracks even if already downloaded')
@@ -1052,7 +1145,15 @@ if __name__ == '__main__':
     if args.cookies_from_browser:
         COOKIES_BROWSER = args.cookies_from_browser
 
-    if args.complete:
+    if args.url and _is_soundcloud(args.url):
+        download_soundcloud(
+            args.url,
+            force=args.force,
+            jobs=max(1, args.jobs),
+            override_artist=args.override_artist,
+            album_name=(args.album if args.album != 'Singles' else None),
+        )
+    elif args.complete:
         channels = [c for c in ([args.url] + (args.channels or [])) if c]
         if not channels:
             print('Provide at least one channel URL/id with --complete.')
@@ -1129,5 +1230,9 @@ if __name__ == '__main__':
                 jobs=max(1, args.jobs),
                 override_artist=args.override_artist,
             )
+        elif _is_soundcloud(url):
+            download_soundcloud(url, force=force, jobs=max(1, args.jobs),
+                                override_artist=args.override_artist,
+                                album_name=(args.album if args.album != 'Singles' else None))
         else:
             download_youtube_audio(url, force=force, override_artist=args.override_artist)
