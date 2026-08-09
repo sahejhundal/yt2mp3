@@ -22,6 +22,18 @@ def sanitize_filename(name):
 
 
 COOKIES_FILE = None
+COOKIES_BROWSER = None  # e.g. 'chrome', 'edge', 'firefox', 'brave'
+
+
+def _apply_cookies(opts):
+    """Attach whichever cookie source the user configured to a yt-dlp opts dict."""
+    if COOKIES_BROWSER:
+        opts['cookiesfrombrowser'] = (COOKIES_BROWSER,)
+        opts.update(_js_challenge_opts())
+    elif COOKIES_FILE:
+        opts['cookiefile'] = COOKIES_FILE
+        opts.update(_js_challenge_opts())
+    return opts
 
 
 def _cookies_json_to_netscape(json_path):
@@ -66,11 +78,7 @@ def _js_challenge_opts():
 
 def _metadata_probe_opts():
     """Auth/challenge options for single metadata probes."""
-    opts = {'quiet': True, 'no_warnings': True}
-    if COOKIES_FILE:
-        opts['cookiefile'] = COOKIES_FILE
-        opts.update(_js_challenge_opts())
-    return opts
+    return _apply_cookies({'quiet': True, 'no_warnings': True})
 
 
 def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
@@ -120,7 +128,10 @@ def make_ydl_opts(output_path, force=False, outtmpl=None, archive_path=None,
 
     if pp_args:
         opts['postprocessor_args'] = pp_args
-    if COOKIES_FILE:
+    if COOKIES_BROWSER:
+        opts['cookiesfrombrowser'] = (COOKIES_BROWSER,)
+        opts.update(_js_challenge_opts())
+    elif COOKIES_FILE:
         # yt-dlp rewrites the cookie file with refreshed tokens on close, so a
         # shared file corrupts under concurrent workers. Give each download its
         # own private copy to read/write safely.
@@ -244,8 +255,7 @@ def list_channel_tracks(channel_or_url):
         'skip_download': True,
         'ignoreerrors': True,
     }
-    if COOKIES_FILE:
-        opts['cookiefile'] = COOKIES_FILE
+    _apply_cookies(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(target, download=False)
 
@@ -860,6 +870,11 @@ def build_parser():
                         help='path to cookies for age-restricted tracks: either a Netscape '
                              'cookies.txt or a browser-extension JSON export (auto-converted). '
                              'Use youtube.com cookies from a logged-in account.')
+    parser.add_argument('--cookies-from-browser', default=None,
+                        metavar='BROWSER',
+                        help='pull cookies straight from your logged-in browser for '
+                             'age-restricted tracks (chrome, edge, firefox, brave, ...). '
+                             'Easiest option - no file export needed. Close the browser first.')
     parser.add_argument('--clean', action='store_true',
                         help='after downloading, run clean_mp3_metadata.py on the output '
                              'folder (normalise titles, set artist, rename files)')
@@ -909,6 +924,9 @@ if __name__ == '__main__':
             print(f'Converted JSON cookies -> {COOKIES_FILE}')
         else:
             COOKIES_FILE = cookies_path
+
+    if args.cookies_from_browser:
+        COOKIES_BROWSER = args.cookies_from_browser
 
     if args.complete:
         channels = [c for c in ([args.url] + (args.channels or [])) if c]

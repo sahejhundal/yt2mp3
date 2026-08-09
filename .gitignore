@@ -7,3 +7,9 @@ cookies.txt
 cookies.json
 *.cookies.txt
 .fingerprints.json
+fpcalc.exe
+run_all.py
+add_missing.py
+dedupe_quarantine_report.txt
+missing_from_downloads.txt
+metadata_cleanup_dry_run.txt
